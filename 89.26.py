@@ -1,4 +1,5 @@
 import os
+import re
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,15 +23,14 @@ warnings.filterwarnings('ignore')
 # ==========================================
 CONFIG = {
     'face_dir':   '/kaggle/input/datasets/nguynnhtlam12/face-features',
-    'scene_dir':  '/kaggle/input/datasets/trieung11/scene-resnet50fpnfinetuned-gew/scene_features_final/scenes',
+    'scene_dir':  '/kaggle/input/datasets/nguynnhtlam12/scene-features-resnetfpnfinetune/scene_features_final/scenes',
     'object_dir': '/kaggle/input/datasets/trieung11/fearturecongnn/objects/objects',
     'output_dir': '/kaggle/working/outputs_scene_guided',
 
     'face_dim':   4096,
     'object_dim': 2048,
-    'scene_dim':  2048,   # ResNet50-FPN output (2048-dim per advisor + 2024 paper)
+    'scene_dim':  2048,
 
-    # [ADVISOR FIX #5] hidden_dim = 512 throughout
     'gat_hidden':  512,
     'num_classes': 3,
 
@@ -39,23 +39,27 @@ CONFIG = {
     'dropout':     0.5,
     'attention_dropout': 0.5,
 
-    # [ADVISOR FIX #1] KNN graph K=3
     'knn_k': 3,
-
     'label_smoothing': 0.1,
 
-    'batch_size':      16,
+    'batch_size':      32,       # giữ từ v3
     'num_workers':     0,
     'prefetch_factor': None,
 
-    'lr':               1e-5,
-    'weight_decay':     5e-2,
-    'grad_clip':        0.5,
-    'epochs':           200,
-    'patience':         20,
-    'scheduler_patience': 6,
-    'scheduler_factor': 0.5,
-    'min_lr':           1e-6,
+    'lr':           1e-5,
+    'weight_decay': 1e-1,        # giữ từ v3
+
+    'grad_clip':    0.5,
+    'epochs':       200,
+
+    # ← CHỈ THAY ĐỔI DUY NHẤT: patience 30 → 15
+    # v3 overfit từ ep40, dừng sớm hơn để bắt đúng đỉnh
+    'patience':     15,
+
+    # giữ nguyên v3
+    'scheduler_patience': 10,
+    'scheduler_factor':   0.5,
+    'min_lr':             1e-6,
 
     'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     'debug_mode': False,
@@ -81,50 +85,32 @@ def print_system_info():
 
 
 # ==========================================
-# [ADVISOR FIX #1] KNN Graph Builder
-# Replaces _build_dense_edges with sparse KNN graph
+# KNN Graph Builder
 # ==========================================
 def build_knn_edges(boxes, k=3):
-    """
-    Build a KNN sparse edge index from bounding box coordinates.
-    Each face is connected to at most K nearest neighbors by Euclidean distance
-    of their bounding box centers.
-
-    Args:
-        boxes: np.ndarray of shape [N, 4], each row = [x1, y1, x2, y2]
-        k:     number of nearest neighbors
-
-    Returns:
-        edge_index: LongTensor of shape [2, E]
-    """
     n = len(boxes)
     if n <= 1:
         return torch.tensor([[0], [0]], dtype=torch.long)
 
-    # Compute center coordinates of each bounding box
     cx = (boxes[:, 0] + boxes[:, 2]) / 2.0
     cy = (boxes[:, 1] + boxes[:, 3]) / 2.0
-    centers = np.stack([cx, cy], axis=1)  # [N, 2]
+    centers = np.stack([cx, cy], axis=1)
 
-    # Pairwise Euclidean distances
-    diff = centers[:, None, :] - centers[None, :, :]  # [N, N, 2]
-    dist = np.sqrt((diff ** 2).sum(axis=-1))           # [N, N]
+    diff = centers[:, None, :] - centers[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(axis=-1))
 
-    # For each node, find K nearest neighbors (excluding self)
     src_list, dst_list = [], []
     actual_k = min(k, n - 1)
     for i in range(n):
         d = dist[i].copy()
-        d[i] = np.inf  # exclude self
+        d[i] = np.inf
         nn_idx = np.argsort(d)[:actual_k]
         for j in nn_idx:
             src_list.append(i)
             dst_list.append(j)
-            # undirected: add reverse edge
             src_list.append(j)
             dst_list.append(i)
 
-    # Deduplicate
     edges = list(set(zip(src_list, dst_list)))
     if len(edges) == 0:
         return torch.tensor([[0], [0]], dtype=torch.long)
@@ -134,7 +120,6 @@ def build_knn_edges(boxes, k=3):
 
 
 def build_dense_edges(num_nodes):
-    """Dense edge builder for context (object) graph — kept as is."""
     if num_nodes <= 1:
         return torch.tensor([[0], [0]], dtype=torch.long)
     edges = [[i, j] for i in range(num_nodes) for j in range(num_nodes) if i != j]
@@ -164,9 +149,42 @@ class ConGNN_Dataset(TorchDataset):
         if len(self.face_files) == 0:
             raise ValueError(f"❌ No data found in {self.face_root} for split '{split}'")
 
+        self._build_scene_index()
+        self._build_object_index()
+
         self._cache = None
         if self.use_cache:
             self._preload_all(split)
+
+    def _build_scene_index(self):
+        print("  🗂️  Building scene file index...")
+        self._scene_index = {}
+        for npy_path in glob.glob(os.path.join(self.scene_root, '**', '*.npy'), recursive=True):
+            stem = os.path.splitext(os.path.basename(npy_path))[0]
+            self._scene_index[stem] = npy_path
+        print(f"  ✅ Scene index: {len(self._scene_index)} files found")
+
+    def _build_object_index(self):
+        print("  🗂️  Building object file index...")
+        self._obj_index = {}
+        for npz_path in glob.glob(os.path.join(self.obj_root, '**', '*.npz'), recursive=True):
+            stem = os.path.splitext(os.path.basename(npz_path))[0]
+            self._obj_index[stem] = npz_path
+        print(f"  ✅ Object index: {len(self._obj_index)} files found")
+
+    def _get_paired_path(self, face_path, target_type):
+        stem = os.path.splitext(os.path.basename(face_path))[0]
+        if target_type == 'scenes':
+            path = self._scene_index.get(stem, None)
+            if path is None and CONFIG['debug_mode']:
+                print(f"⚠️ Scene NOT FOUND for: {stem}")
+            return path
+        elif target_type == 'objects':
+            path = self._obj_index.get(stem, None)
+            if path is None and CONFIG['debug_mode']:
+                print(f"⚠️ Object NOT FOUND for: {stem}")
+            return path
+        return None
 
     def _preload_all(self, split):
         print(f"  💾 Preloading {split.upper()} into RAM...")
@@ -177,31 +195,16 @@ class ConGNN_Dataset(TorchDataset):
                      for s in self._cache) / 1e6
         print(f"  ✅ Cached {len(self._cache)} samples in {time.time()-t0:.1f}s | ~{ram_mb:.0f} MB\n")
 
-    def _get_paired_path(self, face_path, target_type):
-        rel_path = (face_path.split('/faces/')[-1] if '/faces/' in face_path
-                    else face_path.split(self.face_root)[-1].lstrip('/'))
-        if target_type == 'scenes':
-            p = os.path.join(self.scene_root, 'scenes', rel_path).replace('.npz', '.npy')
-            if not os.path.exists(p):
-                p = os.path.join(self.scene_root, rel_path.replace('.npz', '.npy'))
-            return p
-        elif target_type == 'objects':
-            p = os.path.join(self.obj_root, 'objects', rel_path)
-            if not os.path.exists(p):
-                p = os.path.join(self.obj_root, rel_path)
-            return p
-
     def _load_sample(self, idx):
         face_file = self.face_files[idx]
         label = self.label_map.get(os.path.basename(os.path.dirname(face_file)).lower(), 1)
 
-        # --- Load face features + boxes ---
         try:
             data = np.load(face_file)
-            face_feat = data['features']
+            face_feat  = data['features']
             face_boxes = data['boxes']
             if len(face_boxes) > 0:
-                sort_idx = np.argsort(face_boxes[:, 0])
+                sort_idx   = np.argsort(face_boxes[:, 0])
                 face_feat  = face_feat[sort_idx]
                 face_boxes = face_boxes[sort_idx]
         except Exception as e:
@@ -212,44 +215,61 @@ class ConGNN_Dataset(TorchDataset):
         face_feat  = face_feat[:self.max_faces]  if len(face_feat)  > 0 else np.zeros((1, CONFIG['face_dim']), dtype=np.float32)
         face_boxes = face_boxes[:self.max_faces] if len(face_boxes) > 0 else np.zeros((1, 4), dtype=np.float32)
 
-        face_x = torch.tensor(face_feat, dtype=torch.float32)
-
-        # [ADVISOR FIX #1] Use KNN sparse graph instead of dense
+        face_x          = torch.tensor(face_feat, dtype=torch.float32)
         face_edge_index = build_knn_edges(face_boxes, k=CONFIG['knn_k'])
 
-        # --- Load scene feature (2048-dim, ResNet50-FPN) ---
         scene_path = self._get_paired_path(face_file, 'scenes')
         try:
-            scene_feat = (np.load(scene_path) if os.path.exists(scene_path)
-                          else np.zeros(CONFIG['scene_dim'], dtype=np.float32))
-        except Exception:
+            if scene_path and os.path.exists(scene_path):
+                scene_feat = np.load(scene_path)
+                if scene_feat.ndim == 4:
+                    scene_feat = scene_feat.mean(axis=(0, 2, 3))
+                elif scene_feat.ndim == 3:
+                    scene_feat = scene_feat.mean(axis=(-2, -1))
+                elif scene_feat.ndim == 2:
+                    if scene_feat.shape[0] == 1:
+                        scene_feat = scene_feat.squeeze(0)
+                    elif scene_feat.shape[-1] == CONFIG['scene_dim']:
+                        scene_feat = scene_feat.mean(axis=0)
+                    else:
+                        scene_feat = scene_feat.mean(axis=-1)
+                scene_feat = scene_feat.flatten()[:CONFIG['scene_dim']]
+            else:
+                scene_feat = np.zeros(CONFIG['scene_dim'], dtype=np.float32)
+        except Exception as e:
+            if CONFIG['debug_mode']: print(f"⚠️ scene load: {e}")
             scene_feat = np.zeros(CONFIG['scene_dim'], dtype=np.float32)
-        scene_x = torch.tensor(scene_feat.flatten()[:CONFIG['scene_dim']], dtype=torch.float32)
 
-        # --- Load object features ---
+        if len(scene_feat) < CONFIG['scene_dim']:
+            scene_feat = np.pad(scene_feat, (0, CONFIG['scene_dim'] - len(scene_feat)))
+        scene_x = torch.tensor(scene_feat.astype(np.float32), dtype=torch.float32)
+
         obj_path = self._get_paired_path(face_file, 'objects')
         try:
-            obj_feat = (np.load(obj_path)['features'] if os.path.exists(obj_path)
-                        else np.zeros((0, CONFIG['object_dim']), dtype=np.float32))
-        except Exception:
+            if obj_path and os.path.exists(obj_path):
+                obj_data = np.load(obj_path)
+                obj_feat = obj_data['features'] if 'features' in obj_data else obj_data[obj_data.files[0]]
+            else:
+                obj_feat = np.zeros((0, CONFIG['object_dim']), dtype=np.float32)
+        except Exception as e:
+            if CONFIG['debug_mode']: print(f"⚠️ obj load: {e}")
             obj_feat = np.zeros((0, CONFIG['object_dim']), dtype=np.float32)
-        obj_feat = obj_feat[:self.max_objects]
 
-        # Context graph = objects only (scene is handled separately)
-        # [ADVISOR FIX #2] Scene separated from context graph
+        obj_feat = obj_feat[:self.max_objects]
         if len(obj_feat) > 0:
             context_x = torch.tensor(obj_feat, dtype=torch.float32)
         else:
             context_x = torch.zeros((1, CONFIG['object_dim']), dtype=torch.float32)
+
         context_edge_index = build_dense_edges(len(context_x))
 
         return {
-            'face_x': face_x,
-            'face_edge_index': face_edge_index,
-            'context_x': context_x,
+            'face_x':             face_x,
+            'face_edge_index':    face_edge_index,
+            'context_x':          context_x,
             'context_edge_index': context_edge_index,
-            'scene_x': scene_x,   # [2048] — separate from context graph
-            'y': label
+            'scene_x':            scene_x,
+            'y':                  label
         }
 
     def __len__(self): return len(self.face_files)
@@ -258,21 +278,21 @@ class ConGNN_Dataset(TorchDataset):
 
 
 # ==========================================
-# CUSTOM COLLATE (updated to include scene_x)
+# CUSTOM COLLATE
 # ==========================================
 class SimpleBatch:
     def __init__(self, face_x, face_edge_index, face_batch,
                  context_x, context_edge_index, context_batch,
                  scene_x, y, num_graphs):
-        self.face_x = face_x
-        self.face_edge_index = face_edge_index
-        self.face_batch = face_batch
-        self.context_x = context_x
+        self.face_x             = face_x
+        self.face_edge_index    = face_edge_index
+        self.face_batch         = face_batch
+        self.context_x          = context_x
         self.context_edge_index = context_edge_index
-        self.context_batch = context_batch
-        self.scene_x = scene_x   # [B, 2048]
-        self.y = y
-        self.num_graphs = num_graphs
+        self.context_batch      = context_batch
+        self.scene_x            = scene_x
+        self.y                  = y
+        self.num_graphs         = num_graphs
 
     def to(self, device):
         for attr in ['face_x','face_edge_index','face_batch',
@@ -281,7 +301,7 @@ class SimpleBatch:
             setattr(self, attr, getattr(self, attr).to(device))
         return self
 
-    def __getstate__(self):  return self.__dict__
+    def __getstate__(self):    return self.__dict__
     def __setstate__(self, d): self.__dict__.update(d)
 
 
@@ -314,26 +334,28 @@ def custom_collate(batch):
         context_x=torch.cat(cx),
         context_edge_index=torch.cat(cei, dim=1),
         context_batch=torch.cat(cb),
-        scene_x=torch.stack(sx),   # [B, 2048]
+        scene_x=torch.stack(sx),
         y=torch.tensor(yl, dtype=torch.long),
         num_graphs=len(batch)
     )
 
 
 # ==========================================
-# GAT (input_dim now flexible — fed projected 512-dim features)
+# GAT
 # ==========================================
 class MultiLayerGATv2(nn.Module):
-    def __init__(self, in_dim, hidden_dim, num_heads=4, num_layers=2, dropout=0.5, attention_dropout=0.3):
+    def __init__(self, in_dim, hidden_dim, num_heads=4, num_layers=2,
+                 dropout=0.5, attention_dropout=0.3):
         super().__init__()
-        self.input_proj  = nn.Linear(in_dim, hidden_dim)
-        self.input_norm  = nn.LayerNorm(hidden_dim)
-        self.gat_layers  = nn.ModuleList()
-        self.norms       = nn.ModuleList()
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.gat_layers = nn.ModuleList()
+        self.norms      = nn.ModuleList()
         for _ in range(num_layers):
             self.gat_layers.append(
                 GATv2Conv(hidden_dim, hidden_dim // num_heads, heads=num_heads,
-                          dropout=attention_dropout, add_self_loops=True, concat=True, bias=False)
+                          dropout=attention_dropout, add_self_loops=True,
+                          concat=True, bias=False)
             )
             self.norms.append(nn.LayerNorm(hidden_dim))
         self.drop = nn.Dropout(dropout)
@@ -347,55 +369,25 @@ class MultiLayerGATv2(nn.Module):
 
 
 # ==========================================
-# [ADVISOR FIX #2] Scene-Guided Cross-Attention Fusion
-# Replaces IPR_MPNN_Layer entirely.
-#
-# Scene vector (from ResNet50-FPN, projected to 512) acts as Query.
-# All GAT node outputs (Face + Object, 512-dim) act as Key and Value.
-# Allows scene to "attend" to the most emotionally relevant faces/objects.
+# Scene-Guided Cross-Attention Fusion
 # ==========================================
 class SceneGuidedFusion(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
-        # Cross Attention: Query=Scene, Key/Value=Graph_Nodes
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=hidden_dim, num_heads=4, batch_first=True
         )
         self.layer_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, scene_feat, face_nodes, obj_nodes, face_batch, obj_batch):
-        """
-        scene_feat : [B, hidden_dim]   — projected scene embedding
-        face_nodes : [N_face, hidden_dim] — GAT output for face nodes
-        obj_nodes  : [N_obj,  hidden_dim] — GAT output for object nodes
-        face_batch : [N_face] — graph index per face node
-        obj_batch  : [N_obj]  — graph index per object node
-
-        Returns:
-            fused_scene : [B, hidden_dim] — scene-guided global feature
-            attn_weights: [B, 1, max_nodes] — for inspection
-        """
-        # 1. Concatenate all real nodes (Face + Object)
-        # face_nodes: [N, 256], obj_nodes: [M, 256]
-        all_nodes = torch.cat([face_nodes, obj_nodes], dim=0)           # [N+M, D]
-        all_batch = torch.cat([face_batch, obj_batch], dim=0)           # [N+M]
-
-        # 2. Reshape to dense batch for attention: [B, max_nodes, D]
-        # to_dense_batch pads shorter sequences and returns a boolean mask
-        dense_nodes, mask = to_dense_batch(all_nodes, all_batch)        # [B, max_nodes, D], [B, max_nodes]
-
-        # 3. Scene as Query: [B, 1, D]
+        all_nodes = torch.cat([face_nodes, obj_nodes], dim=0)
+        all_batch = torch.cat([face_batch,  obj_batch],  dim=0)
+        dense_nodes, mask = to_dense_batch(all_nodes, all_batch)
         query = scene_feat.unsqueeze(1)
-
-        # 4. Cross-attention: scene "reads" the most important faces/objects
-        # key_padding_mask=~mask tells attention to ignore padding positions
         attn_out, attn_weights = self.cross_attn(
             query, dense_nodes, dense_nodes, key_padding_mask=~mask
         )
-
-        # 5. Residual + norm → [B, 1, D] → [B, D]
         fused_scene = self.layer_norm(query + attn_out).squeeze(1)
-
         return fused_scene, attn_weights
 
 
@@ -403,185 +395,96 @@ class SceneGuidedFusion(nn.Module):
 # MAIN MODEL
 # ==========================================
 class SceneGuided_ConGNN(nn.Module):
-    """
-    Refactored Group Emotion Recognition model following advisor's plan:
-      - KNN sparse face graph (dataset level)
-      - [FIX #5] Early dim reduction: 4096→512 before GAT
-      - [FIX #2] SceneGuidedFusion replaces IPR_MPNN virtual nodes
-      - [FIX #3] Residual addition instead of concat for raw-feat skip
-      - [FIX #4] Simplified loss (Focal_whole + 0.3*CE_face + 0.3*CE_ctx)
-    """
     def __init__(self):
         super().__init__()
-        D   = CONFIG['gat_hidden']       # 512 throughout
-        drp = CONFIG['dropout']
+        D       = CONFIG['gat_hidden']
+        drp     = CONFIG['dropout']
         att_drp = CONFIG['attention_dropout']
 
-        # -------------------------------------------------------
-        # [ADVISOR FIX #5] Early dimensionality reduction
-        # "Apply MLP compression to EACH NODE before building graph"
-        # 4096 → 512 (gradual: 4096 → 1024 → 512)
-        # -------------------------------------------------------
         self.reduce_face = nn.Sequential(
             nn.Linear(CONFIG['face_dim'], 1024),
-            nn.LayerNorm(1024),
-            nn.ReLU(),
-            nn.Dropout(drp),
+            nn.LayerNorm(1024), nn.ReLU(), nn.Dropout(drp),
             nn.Linear(1024, D),
-            nn.LayerNorm(D),
-            nn.ReLU()
+            nn.LayerNorm(D), nn.ReLU()
         )
-
-        # Object: 2048 → 512
         self.reduce_obj = nn.Sequential(
             nn.Linear(CONFIG['object_dim'], D),
-            nn.LayerNorm(D),
-            nn.ReLU(),
-            nn.Dropout(drp)
+            nn.LayerNorm(D), nn.ReLU(), nn.Dropout(drp)
         )
-
-        # Scene: 2048 → 512 (ResNet50-FPN output)
         self.reduce_scene = nn.Sequential(
             nn.Linear(CONFIG['scene_dim'], D),
-            nn.LayerNorm(D),
-            nn.ReLU(),
-            nn.Dropout(drp)
+            nn.LayerNorm(D), nn.ReLU(), nn.Dropout(drp)
         )
 
-        # -------------------------------------------------------
-        # GAT branches (now both receive 512-dim projected features)
-        # [ADVISOR FIX #5] GAT input = 512, hidden = 512
-        # -------------------------------------------------------
         self.face_gat = MultiLayerGATv2(
             in_dim=D, hidden_dim=D,
-            num_heads=CONFIG['num_heads'],
-            num_layers=CONFIG['gat_layers'],
+            num_heads=CONFIG['num_heads'], num_layers=CONFIG['gat_layers'],
             dropout=drp, attention_dropout=att_drp
         )
         self.context_gat = MultiLayerGATv2(
             in_dim=D, hidden_dim=D,
-            num_heads=CONFIG['num_heads'],
-            num_layers=CONFIG['gat_layers'],
+            num_heads=CONFIG['num_heads'], num_layers=CONFIG['gat_layers'],
             dropout=drp, attention_dropout=att_drp
         )
 
-        # Branch classifiers (for auxiliary losses)
         self.clf_face    = nn.Linear(D, CONFIG['num_classes'])
         self.clf_context = nn.Linear(D, CONFIG['num_classes'])
+        self.clf_scene   = nn.Linear(D, CONFIG['num_classes'])
 
-        # -------------------------------------------------------
-        # Scene classifier — ép scene branch học discriminative
-        # feature riêng (giống paper: ResNet50-FPN → FC → classify)
-        # Scene feature tốt hơn → Query của CrossAttention tốt hơn
-        # -------------------------------------------------------
-        self.clf_scene = nn.Linear(D, CONFIG['num_classes'])
-
-        # -------------------------------------------------------
-        # [ADVISOR FIX #2] Scene-Guided Cross-Attention Fusion
-        # Replaces IPR_MPNN virtual node mechanism
-        # -------------------------------------------------------
         self.scene_guided_fusion = SceneGuidedFusion(hidden_dim=D)
 
-        # -------------------------------------------------------
-        # [ADVISOR FIX #3] Residual fusion parameters
-        # final_feature = gat_output + (lambda * linear(raw_feat))
-        # -------------------------------------------------------
-        # Learnable lambda initialized at 0.5
-        self.lambda_face = nn.Parameter(torch.tensor(0.5))
-        self.lambda_obj  = nn.Parameter(torch.tensor(0.5))
-
-        # Linear projectors for raw pooled features (residual path)
-        self.raw_face_proj = nn.Linear(D, D)   # operates on already-reduced 512-dim
+        self.lambda_face   = nn.Parameter(torch.tensor(0.5))
+        self.lambda_obj    = nn.Parameter(torch.tensor(0.5))
+        self.raw_face_proj = nn.Linear(D, D)
         self.raw_obj_proj  = nn.Linear(D, D)
 
-        # -------------------------------------------------------
-        # Final "whole" classifier
-        # Input: fused_scene [B,D] + residual_face [B,D] + residual_obj [B,D]
-        # -------------------------------------------------------
         self.clf_whole = nn.Sequential(
             nn.Linear(D * 3, D),
-            nn.LayerNorm(D),
-            nn.ReLU(),
-            nn.Dropout(drp),
+            nn.LayerNorm(D), nn.ReLU(), nn.Dropout(drp),
             nn.Linear(D, CONFIG['num_classes'])
         )
 
     def forward(self, data):
-        # =====================================================
-        # [ADVISOR FIX #5] Early dim reduction per node
-        # =====================================================
-        face_x_proj = self.reduce_face(data.face_x)          # [N_face, 512]
-        obj_x_proj  = self.reduce_obj(data.context_x)         # [N_obj,  512]
-        scene_proj  = self.reduce_scene(data.scene_x)         # [B, 512]
+        face_x_proj = self.reduce_face(data.face_x)
+        obj_x_proj  = self.reduce_obj(data.context_x)
+        scene_proj  = self.reduce_scene(data.scene_x)
 
-        # =====================================================
-        # GAT forward (input already 512-dim)
-        # =====================================================
-        H_face = self.face_gat(face_x_proj, data.face_edge_index)       # [N_face, 512]
-        H_obj  = self.context_gat(obj_x_proj, data.context_edge_index)  # [N_obj,  512]
+        H_face = self.face_gat(face_x_proj, data.face_edge_index)
+        H_obj  = self.context_gat(obj_x_proj, data.context_edge_index)
 
-        # =====================================================
-        # Auxiliary branch predictions (face & context)
-        # =====================================================
         out_face    = self.clf_face(global_mean_pool(H_face, data.face_batch))
         out_context = self.clf_context(global_mean_pool(H_obj, data.context_batch))
+        out_scene   = self.clf_scene(scene_proj)
 
-        # =====================================================
-        # Scene auxiliary classifier
-        # scene_proj [B, 512] → clf_scene → [B, 3]
-        # Loss riêng buộc reduce_scene + scene_proj học tốt hơn
-        # → Query trong CrossAttention sẽ "thông minh" hơn
-        # =====================================================
-        out_scene = self.clf_scene(scene_proj)   # [B, 3]
-
-        # =====================================================
-        # [ADVISOR FIX #2] Scene-Guided Cross-Attention Fusion
-        # Scene = Query | GAT outputs (face+obj) = Key, Value
-        # =====================================================
         fused_scene, _ = self.scene_guided_fusion(
-            scene_proj,
-            H_face, H_obj,
+            scene_proj, H_face, H_obj,
             data.face_batch, data.context_batch
-        )  # [B, 512]
+        )
 
-        # =====================================================
-        # [ADVISOR FIX #3] Residual addition (no concat)
-        # gat_output + (lambda * linear(raw_feat))
-        # "raw_feat" here is the pooled projected node features
-        # =====================================================
-        raw_face_pooled = global_mean_pool(face_x_proj, data.face_batch)  # [B, 512]
-        raw_obj_pooled  = global_mean_pool(obj_x_proj,  data.context_batch)  # [B, 512]
+        raw_face_pooled = global_mean_pool(face_x_proj, data.face_batch)
+        raw_obj_pooled  = global_mean_pool(obj_x_proj,  data.context_batch)
+        gat_face_pooled = global_mean_pool(H_face, data.face_batch)
+        gat_obj_pooled  = global_mean_pool(H_obj,  data.context_batch)
 
-        gat_face_pooled = global_mean_pool(H_face, data.face_batch)  # [B, 512]
-        gat_obj_pooled  = global_mean_pool(H_obj,  data.context_batch)  # [B, 512]
-
-        # Residual: final = gat_output + lambda * proj(raw)
         feat_face = gat_face_pooled + self.lambda_face * self.raw_face_proj(raw_face_pooled)
         feat_obj  = gat_obj_pooled  + self.lambda_obj  * self.raw_obj_proj(raw_obj_pooled)
 
-        # =====================================================
-        # Whole-branch feature: [fused_scene, feat_face, feat_obj]
-        # =====================================================
-        combined  = torch.cat([fused_scene, feat_face, feat_obj], dim=1)  # [B, 1536]
+        combined  = torch.cat([fused_scene, feat_face, feat_obj], dim=1)
         out_whole = self.clf_whole(combined)
 
         return out_face, out_context, out_scene, out_whole
 
 
 # ==========================================
-# [ADVISOR FIX #4] Simplified Loss Function
-#
-# Old: complex self-distillation + BPF penalty
-# New: Focal_whole + 0.3 * CE_face + 0.3 * CE_context
+# Loss Function
 # ==========================================
 class FocalLoss(nn.Module):
-    """Focal Loss for the whole-branch to handle class imbalance."""
     def __init__(self, num_classes=3, gamma=2.0, alpha=None, label_smoothing=0.1):
         super().__init__()
         self.gamma           = gamma
         self.label_smoothing = label_smoothing
         if alpha is None:
-            self.alpha = torch.tensor([1.0, 2.0, 1.0])  # upweight neutral
+            self.alpha = torch.tensor([1.0, 2.0, 1.0])
         else:
             self.alpha = torch.tensor(alpha)
 
@@ -589,13 +492,10 @@ class FocalLoss(nn.Module):
         target     = target.long()
         self.alpha = self.alpha.to(pred.device)
         log_probs  = F.log_softmax(pred, dim=-1)
-
-        # Label smoothing
         with torch.no_grad():
             true_dist = torch.zeros_like(log_probs)
             true_dist.fill_(self.label_smoothing / (pred.size(-1) - 1))
             true_dist.scatter_(1, target.unsqueeze(1), 1.0 - self.label_smoothing)
-
         ce_loss = torch.sum(-true_dist * log_probs, dim=-1)
         pt      = torch.exp(log_probs).gather(1, target.unsqueeze(1)).squeeze(1)
         focal   = self.alpha[target] * ((1 - pt) ** self.gamma) * ce_loss
@@ -603,40 +503,33 @@ class FocalLoss(nn.Module):
 
 
 def compute_loss(out_f, out_c, out_s, out_w, labels, focal_criterion, ce_criterion):
-    """
-    Loss có thêm scene branch:
-      L_total = Focal(whole) + 0.3*CE(face) + 0.3*CE(context) + 0.3*CE(scene)
-
-    Scene loss ép reduce_scene + clf_scene học feature discriminative riêng
-    → scene_proj (Query trong CrossAttention) chất lượng cao hơn
-    → CrossAttention hoạt động hiệu quả hơn
-    → whole branch cải thiện theo
-    """
-    labels = labels.long()
-    L_w = focal_criterion(out_w, labels)   # Focal loss — whole branch
-    L_f = ce_criterion(out_f, labels)       # CE — face branch
-    L_c = ce_criterion(out_c, labels)       # CE — context branch
-    L_s = ce_criterion(out_s, labels)       # CE — scene branch (mới)
+    labels  = labels.long()
+    L_w     = focal_criterion(out_w, labels)
+    L_f     = ce_criterion(out_f, labels)
+    L_c     = ce_criterion(out_c, labels)
+    L_s     = ce_criterion(out_s, labels)
     L_total = L_w + 0.3 * L_f + 0.3 * L_c + 0.3 * L_s
     return L_total, L_f.item(), L_c.item(), L_s.item(), L_w.item()
 
 
 # ==========================================
-# EARLY STOPPING
+# EARLY STOPPING — dựa vào Val ACC thay vì Val Loss
 # ==========================================
 class ImprovedEarlyStopping:
-    def __init__(self, patience=12, min_delta=0.001, path='checkpoint.pt'):
-        self.patience  = patience
-        self.min_delta = min_delta
-        self.counter   = 0
-        self.best_loss = np.inf
-        self.best_acc  = 0
+    def __init__(self, patience=15, min_delta=0.001, path='checkpoint.pt'):
+        self.patience   = patience
+        self.min_delta  = min_delta
+        self.counter    = 0
+        self.best_loss  = np.inf
+        self.best_acc   = 0
         self.early_stop = False
-        self.path      = path
+        self.path       = path
 
     def __call__(self, val_loss, val_acc, model):
-        improved = (val_loss < self.best_loss - self.min_delta or
-                    (val_acc > self.best_acc and val_loss < self.best_loss + 0.05))
+        # ← track cả loss lẫn acc, ưu tiên acc cao hơn
+        improved = (val_acc > self.best_acc + self.min_delta or
+                    (val_loss < self.best_loss - self.min_delta and
+                     val_acc >= self.best_acc - 0.002))
         if improved:
             self.best_loss = val_loss
             self.best_acc  = val_acc
@@ -683,11 +576,40 @@ def plot_results(history, y_true, y_pred, suffix=''):
     axes[1,1].set_title('Learning Rate'); axes[1,1].set_yscale('log'); axes[1,1].grid(alpha=0.3)
 
     axes[1,2].axis('off')
-
     plt.tight_layout()
     fname = f"{CONFIG['output_dir']}/results{suffix}.png"
     plt.savefig(fname, dpi=300); plt.show()
     print(f"✅ Plot saved: {fname}")
+
+
+# ==========================================
+# DEBUG
+# ==========================================
+def debug_data_loading(dataset, num_samples=5):
+    print("\n🔍 DEBUG: Checking scene/object feature shapes...")
+    scene_zeros = obj_zeros = 0
+    for i in range(min(num_samples, len(dataset.face_files))):
+        face_file  = dataset.face_files[i]
+        scene_path = dataset._get_paired_path(face_file, 'scenes')
+        obj_path   = dataset._get_paired_path(face_file, 'objects')
+        scene_exists = os.path.exists(scene_path) if scene_path else False
+        obj_exists   = os.path.exists(obj_path)   if obj_path   else False
+        if scene_exists:
+            s = np.load(scene_path)
+            print(f"  Scene [{i}]: shape={s.shape}, dtype={s.dtype}")
+        else:
+            print(f"  Scene [{i}]: ❌ NOT FOUND — {scene_path}"); scene_zeros += 1
+        if obj_exists:
+            try:
+                o    = np.load(obj_path)
+                feat = o['features'] if 'features' in o else o[o.files[0]]
+                print(f"  Obj   [{i}]: shape={feat.shape}, dtype={feat.dtype}")
+            except Exception as e:
+                print(f"  Obj   [{i}]: ❌ {e}")
+        else:
+            print(f"  Obj   [{i}]: ❌ NOT FOUND — {obj_path}"); obj_zeros += 1
+    print(f"\n  Scene missing: {scene_zeros}/{num_samples}")
+    print(f"  Obj   missing: {obj_zeros}/{num_samples}\n")
 
 
 # ==========================================
@@ -709,6 +631,8 @@ def main():
     except Exception as e:
         print(f"❌ {e}"); return
 
+    debug_data_loading(train_ds, num_samples=10)
+
     kw = {
         'batch_size': CONFIG['batch_size'],
         'collate_fn': custom_collate,
@@ -726,24 +650,35 @@ def main():
     print("🧪 Sanity check first batch...")
     try:
         tb = next(iter(train_loader)).to(CONFIG['device'])
-        print(f"✅ Face: {tb.face_x.shape} | Context: {tb.context_x.shape} | Scene: {tb.scene_x.shape}\n")
+        print(f"✅ Face: {tb.face_x.shape} | Context: {tb.context_x.shape} | Scene: {tb.scene_x.shape}")
+        scene_nonzero = (tb.scene_x.abs().sum(dim=1) > 0).float().mean()
+        ctx_nonzero   = (tb.context_x.abs().sum(dim=1) > 0).float().mean()
+        print(f"   Scene non-zero ratio: {scene_nonzero:.2%} | Context non-zero: {ctx_nonzero:.2%}")
+        if scene_nonzero < 0.5: print("   ⚠️  WARNING: >50% scene features are zero!")
+        if ctx_nonzero   < 0.5: print("   ⚠️  WARNING: >50% context features are zero!")
         del tb
         if torch.cuda.is_available(): torch.cuda.empty_cache()
     except Exception as e:
         print(f"❌ {e}"); return
 
-    print("🏗️  Building model...")
+    print("\n🏗️  Building model...")
     model = SceneGuided_ConGNN().to(CONFIG['device'])
     tp = sum(p.numel() for p in model.parameters())
     tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Total params: {tp:,} | Trainable: {tr:,}\n")
 
-    optimizer      = torch.optim.Adam(model.parameters(), lr=CONFIG['lr'],
-                                      weight_decay=CONFIG['weight_decay'])
-    scheduler      = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', patience=CONFIG['scheduler_patience'],
-        factor=CONFIG['scheduler_factor'], min_lr=CONFIG['min_lr']
+    # Giữ nguyên v3: AdamW + CosineAnnealingLR
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=CONFIG['lr'],
+        weight_decay=CONFIG['weight_decay']
     )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=CONFIG['epochs'],
+        eta_min=CONFIG['min_lr']
+    )
+
     focal_criterion = FocalLoss(CONFIG['num_classes'], gamma=2.0,
                                 label_smoothing=CONFIG['label_smoothing'])
     ce_criterion    = nn.CrossEntropyLoss()
@@ -771,7 +706,8 @@ def main():
                 batch = batch.to(CONFIG['device'])
                 optimizer.zero_grad()
                 out_f, out_c, out_s, out_w = model(batch)
-                loss, *_ = compute_loss(out_f, out_c, out_s, out_w, batch.y, focal_criterion, ce_criterion)
+                loss, *_ = compute_loss(out_f, out_c, out_s, out_w, batch.y,
+                                        focal_criterion, ce_criterion)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['grad_clip'])
                 optimizer.step()
@@ -795,12 +731,10 @@ def main():
                     out_f, out_c, out_s, out_w = model(batch)
                     loss, lf, lc, ls, lw = compute_loss(out_f, out_c, out_s, out_w, batch.y,
                                                          focal_criterion, ce_criterion)
-                    bs = len(batch.y)
+                    bs      = len(batch.y)
                     v_loss += loss.item() * bs
-                    v_lf   += lf * bs
-                    v_lc   += lc * bs
-                    v_ls   += ls * bs
-                    v_lw   += lw * bs
+                    v_lf   += lf * bs; v_lc += lc * bs
+                    v_ls   += ls * bs; v_lw += lw * bs
                     v_af   += (out_f.argmax(1) == batch.y).sum().item()
                     v_ac   += (out_c.argmax(1) == batch.y).sum().item()
                     v_as   += (out_s.argmax(1) == batch.y).sum().item()
@@ -810,6 +744,8 @@ def main():
                     print(f"\n❌ val batch: {e}")
                     if CONFIG['debug_mode']: raise
                     continue
+
+        scheduler.step()  # CosineAnnealing không cần val_loss
 
         t_loss /= len(train_loader)
         for k, v in zip(
@@ -822,17 +758,16 @@ def main():
         history['lr'].append(get_lr(optimizer))
 
         vl  = v_loss / total
-        vaw = v_aw   / total
-        vaf = v_af   / total
-        vac = v_ac   / total
-        vas = v_as   / total
+        vaw = v_aw / total
+        vaf = v_af / total
+        vac = v_ac / total
+        vas = v_as / total
 
         print(f"\nEp {epoch+1:03d} [{time.time()-t_ep:.0f}s] "
               f"TrL={t_loss:.4f} | ValL={vl:.4f} | "
               f"Whole={vaw:.4f} | Face={vaf:.4f} | Ctx={vac:.4f} | "
               f"Scene={vas:.4f} | LR={get_lr(optimizer):.1e}")
 
-        scheduler.step(vl)
         early_stop(vl, vaw, model)
         if early_stop.early_stop:
             print(f"\n🛑 Early stop at epoch {epoch+1}")
@@ -857,8 +792,7 @@ def main():
                 y_ps.extend(os_.argmax(1).cpu().numpy())
                 y_pw.extend(ow.argmax(1).cpu().numpy())
             except Exception as e:
-                print(f"\n❌ test: {e}")
-                continue
+                print(f"\n❌ test: {e}"); continue
 
     for name, preds in [('FACE', y_pf), ('CONTEXT', y_pc), ('SCENE', y_ps), ('WHOLE', y_pw)]:
         acc = accuracy_score(y_true, preds)
