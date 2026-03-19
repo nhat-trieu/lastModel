@@ -1,8 +1,8 @@
 """
-extract_face_features_with_bbox.py
+extract_face_features_with_bbox_v2.py
 ====================================
-Extract face features 4096-dim từ VGGFace đã finetune
-Dùng _bbox.npy thật thay vì dummy boxes
+Extract face features 4096-dim từ VGGFace đã finetune (Bản V2)
+Đã fix Normalize RGB và tắt Dropout khi inference.
 Output: .npz chứa features (N,4096) + boxes (N,4) cho mỗi ảnh gốc
 """
 
@@ -18,16 +18,16 @@ import torch.nn as nn
 from torchvision import transforms
 
 # ==========================================
-# CONFIG — chỉnh path checkpoint sau khi finetune xong
+# CONFIG
 # ==========================================
 CONFIG = {
-    # ✅ Sau khi finetune xong, trỏ về checkpoint mới
-    'ckpt_path': '/kaggle/input/datasets/nguynnhtlam12/vggface/vggface_groupemow_best.pth',
-    # Nếu chưa finetune xong, dùng tạm cái cũ:
-    # 'ckpt_path': '/kaggle/input/datasets/trieung11/finetunevggface11/vggface_epoch09_acc0.6945.pth',
+    # ✅ Đường dẫn tới file best.pth của bản V2 bạn vừa finetune xong
+    'ckpt_path': '/kaggle/input/datasets/nguynnhtlam12/v2vggfacefinetunegroupemow/vggface_groupemow_best.pth', # Sửa lại đường dẫn này nếu bạn để ở input
 
     'data_root':  '/kaggle/input/datasets/trieung11/full-groupemow-face-cropped/GroupEmoW_Full_Face_Cropped',
-    'output_dir': '/kaggle/working/face_features_bbox',
+    
+    # Đổi tên output dir để phân biệt với bản cũ
+    'output_dir': '/kaggle/working/face_features_bbox_v2',
 
     'batch_size':  64,
     'num_workers': 2,
@@ -41,12 +41,11 @@ LABEL_MAP = {'negative': 0, 'neutral': 1, 'positive': 2}
 
 os.makedirs(CONFIG['output_dir'], exist_ok=True)
 
-
 # ==========================================
-# MODEL (giữ nguyên architecture để load weights)
+# MODEL (Cập nhật giống y hệt lúc Train V2)
 # ==========================================
 class VGG_16(nn.Module):
-    def __init__(self, num_classes=3):
+    def __init__(self, num_classes=3, dropout=0.5):
         super().__init__()
         self.conv1_1 = nn.Conv2d(3, 64, 3, padding=1)
         self.conv1_2 = nn.Conv2d(64, 64, 3, padding=1)
@@ -66,9 +65,10 @@ class VGG_16(nn.Module):
         self.fc8  = nn.Linear(4096, num_classes)
         self.relu = nn.ReLU(inplace=True)
         self.pool = nn.MaxPool2d(2, 2)
+        self.drop = nn.Dropout(dropout) # Thêm vào để load state_dict không bị báo lỗi
 
     def extract(self, x):
-        """Trả về fc7 4096-dim, không dropout (inference mode)"""
+        """Trả về fc7 4096-dim, KHÔNG xài dropout (inference mode)"""
         x = self.relu(self.conv1_1(x)); x = self.relu(self.conv1_2(x)); x = self.pool(x)
         x = self.relu(self.conv2_1(x)); x = self.relu(self.conv2_2(x)); x = self.pool(x)
         x = self.relu(self.conv3_1(x)); x = self.relu(self.conv3_2(x))
@@ -82,24 +82,28 @@ class VGG_16(nn.Module):
         x = self.relu(self.fc7(x))   # [B, 4096]
         return x
 
-
+# ==========================================
+# TRANSFORMS (Đã fix Normalize RGB giống V2)
+# ==========================================
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize([0.367, 0.411, 0.507], [1, 1, 1]),
+    transforms.Normalize([0.507, 0.411, 0.367], [1, 1, 1]), # <--- FIX CHÍ MẠNG Ở ĐÂY
 ])
-
 
 def load_model():
     print(f"📦 Loading checkpoint: {CONFIG['ckpt_path']}")
-    model = VGG_16(num_classes=3).to(CONFIG['device'])
+    model = VGG_16(num_classes=3, dropout=0.5).to(CONFIG['device'])
+    
+    if not os.path.exists(CONFIG['ckpt_path']):
+        raise FileNotFoundError(f"❌ Không tìm thấy file: {CONFIG['ckpt_path']}")
+        
     ckpt  = torch.load(CONFIG['ckpt_path'], map_location='cpu')
     sd    = ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt))
     model.load_state_dict(sd, strict=False)
-    model.eval()
+    model.eval() # Bật chế độ đánh giá (tắt Dropout/BatchNorm)
     print(f"  ✅ Model loaded")
     return model
-
 
 def get_output_path(img_path, split, cls_name):
     """
@@ -110,11 +114,9 @@ def get_output_path(img_path, split, cls_name):
     match = re.match(r'^(.+?)_face_(\d+)\.(jpg|jpeg|png)$', basename, re.IGNORECASE)
     orig_name = match.group(1) if match else os.path.splitext(basename)[0]
 
-    # ĐÃ SỬA: Bỏ thư mục 'groupemow' lót ở giữa
     out_dir = os.path.join(CONFIG['output_dir'], split, cls_name.lower())
     os.makedirs(out_dir, exist_ok=True)
     return os.path.join(out_dir, f'{orig_name}.npz'), orig_name
-
 
 def extract_split(model, split):
     split_dir = os.path.join(CONFIG['data_root'], split)
@@ -122,8 +124,6 @@ def extract_split(model, split):
         print(f"  ⚠️ Not found: {split_dir}")
         return 0
 
-    # Group face crops theo ảnh gốc
-    # Key: (cls_name, orig_name) → list of (img_path, bbox [x1,y1,x2,y2])
     groups = defaultdict(list)
 
     for cls_name in os.listdir(split_dir):
@@ -131,7 +131,6 @@ def extract_split(model, split):
             continue
         cls_dir = os.path.join(split_dir, cls_name)
 
-        # Lấy tất cả ảnh crop (không lấy _bbox.npy)
         img_files = []
         for ext in ['*.jpg', '*.jpeg', '*.png']:
             img_files.extend(glob.glob(os.path.join(cls_dir, ext)))
@@ -143,19 +142,16 @@ def extract_split(model, split):
                 continue
             orig_name = match.group(1)
 
-            # Load bbox thật từ _bbox.npy
-            stem     = os.path.splitext(img_path)[0]   # bỏ .jpg
+            stem     = os.path.splitext(img_path)[0]
             bbox_path = stem + '_bbox.npy'
             if os.path.exists(bbox_path):
-                raw_bbox = np.load(bbox_path)   # shape (6,): [x1,y1,x2,y2,score,?]
-                bbox = raw_bbox[:4].astype(np.float32)  # chỉ lấy [x1,y1,x2,y2]
+                raw_bbox = np.load(bbox_path)
+                bbox = raw_bbox[:4].astype(np.float32)
             else:
-                # Fallback: dùng dummy nếu không có bbox
                 bbox = np.array([0, 0, 1, 1], dtype=np.float32)
 
             groups[(cls_name, orig_name)].append((img_path, bbox))
 
-    # Extract theo group
     total_saved = 0
     all_groups  = list(groups.items())
 
@@ -165,7 +161,6 @@ def extract_split(model, split):
             total_saved += 1
             continue
 
-        # Sort theo face index để thứ tự nhất quán
         face_list.sort(key=lambda x: x[0])
 
         imgs_tensor = []
@@ -182,7 +177,6 @@ def extract_split(model, split):
         if len(imgs_tensor) == 0:
             continue
 
-        # Batch inference
         batch = torch.stack(imgs_tensor).to(CONFIG['device'])
         with torch.no_grad():
             feats = model.extract(batch).cpu().numpy()  # (N, 4096)
@@ -194,10 +188,9 @@ def extract_split(model, split):
 
     return total_saved
 
-
 def main():
     print("="*70)
-    print("  EXTRACT FACE FEATURES WITH REAL BOUNDING BOXES")
+    print("  EXTRACT FACE FEATURES (V2) WITH REAL BOUNDING BOXES")
     print(f"  Device: {CONFIG['device']}")
     print("="*70 + "\n")
 
@@ -213,28 +206,23 @@ def main():
     print(f"\n✅ Total: {total} .npz files")
     print(f"📁 Output: {CONFIG['output_dir']}")
 
-    # Verify 1 file mẫu
     samples = glob.glob(os.path.join(CONFIG['output_dir'], '**/*.npz'), recursive=True)
     if samples:
         s = np.load(samples[0])
         print(f"\n📋 Sample: {os.path.basename(samples[0])}")
         print(f"   features: {s['features'].shape}  ← (num_faces, 4096)")
         print(f"   boxes:    {s['boxes'].shape}      ← (num_faces, 4) [x1,y1,x2,y2]")
-        print(f"   boxes[0]: {s['boxes'][0]}         ← real coordinates ✅")
 
-    # Zip để tải về
     print("\n📦 Zipping features...")
-    zip_path = '/kaggle/working/face_features_bbox.zip'
+    zip_path = '/kaggle/working/face_features_bbox_v2.zip'
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(CONFIG['output_dir']):
             for f in files:
                 abs_p = os.path.join(root, f)
-                # ĐÃ SỬA: Bỏ os.path.dirname() để zip thẳng vào train/val/test
                 rel_p = os.path.relpath(abs_p, CONFIG['output_dir'])
                 zf.write(abs_p, rel_p)
     print(f"✅ {zip_path}  ({os.path.getsize(zip_path)/1e6:.1f} MB)")
-    print("📥 Download từ Kaggle Output tab → face_features_bbox.zip")
-
+    print("📥 Download từ Kaggle Output tab → face_features_bbox_v2.zip")
 
 if __name__ == '__main__':
     main()
