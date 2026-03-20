@@ -19,9 +19,9 @@ warnings.filterwarnings('ignore')
 
 # 1. Cấu hình
 CONFIG = {
-    'data_root': '/kaggle/input/mydata',
+    'data_root': '/kaggle/input/groupemowfull/GroupEmoW',
     'base_output': '/kaggle/working/features_congnn',
-    'output_dir': '/kaggle/working/features_congnn/SiteGroEmo_objects',
+    'output_dir': '/kaggle/working/features_congnn/objects',
     'max_objects': 10,
     'conf_threshold': 0.5,
     'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -117,20 +117,18 @@ def run_object_extraction():
                                       boxes=np.array(valid_boxes, dtype=np.float32))
                 except: continue
 
-    # 4. Nén kết quả
+    # 4. Nén kết quả (Đoạn code bạn vừa thêm)
     print("\n📦 Đang nén folder OBJECTS...")
-    
-    # Lấy tên thư mục con cuối cùng từ đường dẫn output_dir
-    folder_to_zip = os.path.basename(CONFIG['output_dir']) # Kết quả là 'SiteGroEmo_objects'
-    
-    shutil.make_archive('/kaggle/working/objects_extracted', 'zip', 
+    shutil.make_archive('/kaggle/working/objects', 'zip', 
                         root_dir=CONFIG['base_output'], 
-                        base_dir=folder_to_zip)
+                        base_dir='objects')
     
-    zip_path = '/kaggle/working/objects_extracted.zip'
+    zip_path = '/kaggle/working/objects.zip'
     if os.path.exists(zip_path):
         size_mb = os.path.getsize(zip_path) / (1024*1024)
         print(f"✅ Xong! File nặng: {size_mb:.2f} MB")
+    else:
+        print("❌ Lỗi: Không thể tạo file nén.")
 
 if __name__ == "__main__":
     run_extraction_code = run_object_extraction()

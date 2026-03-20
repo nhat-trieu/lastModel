@@ -1,5 +1,6 @@
 """
 finetune_vggface_groupemow.py
+weight: https://www.kaggle.com/datasets/nguynnhtlam12/v2vggfacefinetunegroupemow
 =====================================
 Fine-tune VGGFace trên GroupEmoW face crops
 Sau đó extract features 4096-dim + bbox → .npz per ảnh gốc
@@ -13,7 +14,7 @@ Fixes từ bài báo:
 import os, glob, re, time, zipfile
 import numpy as np
 from PIL import Image
-Image.MAX_IMAGE_PIXELS = None
+
 from tqdm.auto import tqdm
 from collections import defaultdict
 

@@ -1,6 +1,7 @@
 
 """
 finetune_and_extract_scene.py
+weight:   https://drive.google.com/drive/folders/14BSBlDVF6qNuEurvmvtP3Oq8HfPNpK5L?usp=sharing
 ─────────────────────────────────────────────────────────────────────────────
 !pip install torch torchvision facenet-pytorch timm --upgrade
 import shutil
@@ -9,6 +10,7 @@ shutil.copy(
     '/kaggle/working/resnet50fpn_groupemow_v2.pth'
 )
 print("✅ Copied")
+
 ─────────────────────────────────────────────────────────────────────────────
 """
 

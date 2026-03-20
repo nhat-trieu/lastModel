@@ -4,6 +4,7 @@ extract_face_features_with_bbox_v2.py
 Extract face features 4096-dim từ VGGFace đã finetune (Bản V2)
 Đã fix Normalize RGB và tắt Dropout khi inference.
 Output: .npz chứa features (N,4096) + boxes (N,4) cho mỗi ảnh gốc
+link weight: https://www.kaggle.com/datasets/nguynnhtlam12/v2vggfacefinetunegroupemow
 """
 
 import os, glob, re, zipfile
