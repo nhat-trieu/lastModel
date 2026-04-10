@@ -1,35 +1,29 @@
 """
-GAF2_finetuneExtractVGG_Face_v4.py
+GAF3_finetuneExtractVGG_Face_v4.py
 =====================================
-Pipeline hoàn chỉnh cho GAF2 — A100 optimized:
+Pipeline hoàn chỉnh cho GAF3 — A100 optimized:
   1. Detect + Crop khuôn mặt bằng RetinaFace (lưu crop + bbox)
   2. Fine-tune VGGFace (VGG16) trên face crops — 3 class: negative/neutral/positive
   3. Extract features 4096-dim + bbox → .npz per ảnh gốc
 
-Fixes so với v3:
-  - LABEL_MAP đúng: negative=0, neutral=1, positive=2 (nhất quán với GAF3/GroupEmoW)
-  - Bỏ self.eval() khỏi extract() — caller tự quản lý mode
+Khác GAF2:
+  - data_root: GAF_3.0 (tên folder có dấu chấm)
+  - SPLITS: ['Train', 'Validation'] (không phải 'Val')
+  - GAF3 cấu trúc lồng: Train/Positive/Positive/*.jpg
+  - lr=1e-5, weight_decay=1e-4, patience=12 (data nhiều hơn → regularize nhẹ hơn)
+  - Bỏ ColorJitter + RandomGrayscale (data đủ nhiều)
+  - batch_size=64 (giữ paper baseline, data lớn hơn nên không cần scale mạnh)
+
+Fixes so với file cũ:
+  - LABEL_MAP đúng: negative=0, neutral=1, positive=2
+  - Bỏ self.eval() trong extract() — caller tự quản lý
   - model.eval() tường minh trong run_extract()
+  - torch.no_grad() wrap ở caller thay vì bên trong extract()
   - persistent_workers guard (nw > 0)
-  - AMP + GradScaler đúng cách (scaler chỉ trong train loop)
-  - Weighted CrossEntropyLoss tự động từ class counts
-  - batch_size=128, lr=1.5e-4 (Linear Scaling Rule cho A100)
+  - Weighted CrossEntropyLoss tự động
+  - AMP đúng cách (chỉ train loop)
   - A100 TF32 + cudnn.benchmark
-  - Colab paths (Google Drive output)
-
-Cấu trúc thư mục đầu vào:
-  GAF_2/
-    Train/
-      Positive/  *.jpg
-      Neutral/   *.jpg
-      Negative/  *.jpg
-    Val/
-      Positive/
-      Neutral/
-      Negative/
 """
-
-# !pip install retina-face opencv-python-headless tqdm -q
 
 import os, glob, re, time, zipfile
 import numpy as np
@@ -48,6 +42,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torch.cuda.amp import autocast, GradScaler
 
+import kagglehub
+
 # ── A100 optimizations ────────────────────────────────────────────────────────
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32       = True
@@ -56,52 +52,61 @@ torch.backends.cudnn.benchmark        = True
 # ==========================================
 # CONFIG
 # ==========================================
-DRIVE_DIR = '/content/drive/MyDrive/GAF2_Project'
+path_gaf3    = kagglehub.dataset_download("trieung11/gaf-3000")
+path_vggface = kagglehub.dataset_download("trieung11/1821153vgg-face")
+print(f"✅ GAF3    : {path_gaf3}")
+print(f"✅ VGGFace : {path_vggface}")
+
+pretrained = path_vggface if path_vggface.endswith('.pth') \
+             else f'{path_vggface}/VGG_FACE.pth'
+
+DRIVE_DIR = '/content/drive/MyDrive/GAF3_Project'
 
 CONFIG = {
-    # ── Input (kagglehub cache path trên Colab) ────────────────────────────
-    'data_root':       '/root/.cache/kagglehub/datasets/trieung11/gaf2000/versions/1/GAF_2',
-    'pretrained_path': '/root/.cache/kagglehub/datasets/trieung11/1821153vgg-face/versions/1/VGG_FACE.pth',
+    # ── Input ─────────────────────────────────────────────────────────────
+    'data_root':       f'{path_gaf3}/GAF_3.0',
+    'pretrained_path': pretrained,
 
-    # ── Crop dir (trên /content để tốc độ I/O nhanh) ──────────────────────
-    'crop_dir':        '/content/GAF2_Face_Cropped',
+    # ── Crop dir (trên /content để I/O nhanh) ─────────────────────────────
+    'crop_dir':        '/content/GAF3_Face_Cropped',
 
-    # ── Output → Google Drive (persistent qua session) ─────────────────────
+    # ── Output → Google Drive ─────────────────────────────────────────────
     'output_dir':      DRIVE_DIR,
-    'ckpt_path':       f'{DRIVE_DIR}/vgg_best_gaf2.pth',
-    'feat_dir':        f'{DRIVE_DIR}/features_vgg_gaf2',
+    'ckpt_path':       f'{DRIVE_DIR}/vgg_best_gaf3.pth',
+    'feat_dir':        f'{DRIVE_DIR}/features_vgg_gaf3',
 
     # ── Detection ─────────────────────────────────────────────────────────
     'detection_threshold': 0.9,
 
-    # ── Training — A100 tuned ─────────────────────────────────────────────
-    # batch 64 → lr 1e-4 (paper baseline)
-    # batch 128 → lr ~1.5e-4 (Linear Scaling Rule: lr * batch_new/batch_old)
-    # Giữ nhẹ hơn ×2 vì Adam ít nhạy scaling hơn SGD và GAF2 dataset nhỏ
+    # ── Training ──────────────────────────────────────────────────────────
+    # GAF3 data nhiều hơn GAF2 → lr nhỏ hơn, regularization nhẹ hơn
+    # batch_size=128 (A100 optimized, scale từ 64)
+    # lr=1.5e-5 (scale nhẹ theo batch 64→128)
     'batch_size':         128,
     'num_workers':        4,
     'img_size':           224,
-    'lr':                 1.5e-4,
-    'weight_decay':       1e-3,
+    'lr':                 1.5e-5,
+    'weight_decay':       1e-4,
     'epochs':             50,
-    'patience':           15,
-    'scheduler_patience': 6,
+    'patience':           12,
+    'scheduler_patience': 5,
     'time_limit_sec':     11.5 * 3600,
 
     'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
 }
 
-SPLITS    = ['Train', 'Val']
+# GAF3: Train + Validation (không có Test split)
+SPLITS = ['Train', 'Validation']
 
-# negative=0, neutral=1, positive=2 — nhất quán với GAF3 và GroupEmoW
+# negative=0, neutral=1, positive=2 — nhất quán với GAF2 và GroupEmoW
 LABEL_MAP = {'negative': 0, 'neutral': 1, 'positive': 2}
 
 for d in [CONFIG['crop_dir'], CONFIG['output_dir'], CONFIG['feat_dir']]:
     os.makedirs(d, exist_ok=True)
 
-print(f"✅ Device : {CONFIG['device']}")
-print(f"✅ Output → {CONFIG['output_dir']}")
-print(f"✅ LABEL_MAP: {LABEL_MAP}")
+print(f"✅ Device    : {CONFIG['device']}")
+print(f"✅ Output    → {CONFIG['output_dir']}")
+print(f"✅ LABEL_MAP : {LABEL_MAP}")
 
 
 # ==========================================
@@ -141,7 +146,7 @@ class VGG_16(nn.Module):
         x = self.relu(self.conv5_3(x)); x = self.pool(x)
         x = x.view(x.size(0), -1)
         x = self.relu(self.fc6(x)); x = self.drop(x)
-        x = self.relu(self.fc7(x))   # 4096-dim, no dropout before fc8 branch
+        x = self.relu(self.fc7(x))
         return x
 
     def forward(self, x):
@@ -150,9 +155,8 @@ class VGG_16(nn.Module):
     def extract(self, x):
         """
         Extract fc7 4096-dim features — no dropout.
-        KHÔNG gọi self.eval() ở đây — caller phải tự gọi model.eval() trước.
-        Caller cũng phải wrap bằng torch.no_grad() hoặc hàm này nhận
-        tensor đã detach.
+        KHÔNG gọi self.eval() — caller phải gọi model.eval() trước.
+        Caller wrap torch.no_grad() bên ngoài.
         """
         x = self.relu(self.conv1_1(x)); x = self.relu(self.conv1_2(x)); x = self.pool(x)
         x = self.relu(self.conv2_1(x)); x = self.relu(self.conv2_2(x)); x = self.pool(x)
@@ -169,14 +173,18 @@ class VGG_16(nn.Module):
 
 
 # ==========================================
-# BƯỚC 1: DETECT + CROP KHUÔN MẶT
+# BƯỚC 1: DETECT + CROP
 # ==========================================
+def _resolve_cls_dir(parent: str, cls_name: str) -> str:
+    """
+    GAF3 có cấu trúc lồng: Train/Positive/Positive/*.jpg
+    Hàm này tự detect và trả về đúng thư mục chứa ảnh.
+    """
+    inner = os.path.join(parent, cls_name, cls_name)
+    return inner if os.path.exists(inner) else os.path.join(parent, cls_name)
+
+
 def run_face_detection():
-    """
-    Detect và crop khuôn mặt từ GAF2 gốc.
-    Lưu crop + bbox (6 giá trị: x1,y1,x2,y2,img_w,img_h).
-    Tự bỏ qua nếu crop_dir đã có dữ liệu (resume-friendly).
-    """
     print("=" * 70)
     print("  BƯỚC 1: FACE DETECTION + CROPPING (RetinaFace)")
     print("=" * 70 + "\n")
@@ -205,7 +213,7 @@ def run_face_detection():
             if cls_name.lower() not in LABEL_MAP:
                 continue
 
-            cls_dir     = os.path.join(split_dir, cls_name)
+            cls_dir     = _resolve_cls_dir(split_dir, cls_name)
             out_cls_dir = os.path.join(CONFIG['crop_dir'], split, cls_name)
             os.makedirs(out_cls_dir, exist_ok=True)
 
@@ -270,7 +278,7 @@ def run_face_detection():
 # ==========================================
 # BƯỚC 2: DATASET + TRANSFORMS
 # ==========================================
-class GAF2FaceDataset(Dataset):
+class GAF3FaceDataset(Dataset):
     def __init__(self, split, transform):
         self.transform = transform
         self.samples   = []
@@ -286,6 +294,7 @@ class GAF2FaceDataset(Dataset):
             label = LABEL_MAP.get(cls_name.lower())
             if label is None:
                 continue
+            # Sau khi crop, cấu trúc flat: crop_dir/Train/Positive/*.jpg
             cls_dir = os.path.join(split_dir, cls_name)
             for ext in ['*.jpg', '*.jpeg', '*.png']:
                 for p in glob.glob(os.path.join(cls_dir, ext)):
@@ -320,8 +329,7 @@ class GAF2FaceDataset(Dataset):
         return self.transform(img), label
 
 
-# Normalize: VGGFace gốc dùng mean subtraction (BGR), không có std scaling.
-# Dùng RGB order với std=[1,1,1] để mô phỏng behavior tương tự.
+# Normalize: VGGFace mean subtraction (RGB), std=[1,1,1]
 _NORM_MEAN = [0.507, 0.411, 0.367]
 _NORM_STD  = [1.0,   1.0,   1.0]
 
@@ -329,8 +337,7 @@ train_tf = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.RandomHorizontalFlip(0.5),
     transforms.RandomRotation(20),
-    transforms.ColorJitter(brightness=0.3, contrast=0.3),  # thêm vì GAF2 ít data
-    transforms.RandomGrayscale(p=0.1),                      # color invariance nhẹ
+    # GAF3 data đủ nhiều → không cần ColorJitter + RandomGrayscale
     transforms.ToTensor(),
     transforms.Normalize(_NORM_MEAN, _NORM_STD),
 ])
@@ -347,7 +354,7 @@ val_tf = transforms.Compose([
 # ==========================================
 def run_finetune():
     print("\n" + "=" * 70)
-    print("  BƯỚC 2: FINE-TUNE VGGFace — GAF2 (A100)")
+    print("  BƯỚC 2: FINE-TUNE VGGFace — GAF3 (A100)")
     print(f"  Device      : {CONFIG['device']}")
     print(f"  Batch size  : {CONFIG['batch_size']}")
     print(f"  LR          : {CONFIG['lr']}")
@@ -355,8 +362,8 @@ def run_finetune():
     print("=" * 70 + "\n")
 
     print("📂 Loading datasets...")
-    train_ds = GAF2FaceDataset('Train', train_tf)
-    val_ds   = GAF2FaceDataset('Val',   val_tf)
+    train_ds = GAF3FaceDataset('Train',      train_tf)
+    val_ds   = GAF3FaceDataset('Validation', val_tf)
 
     # Weighted CrossEntropyLoss — tự động từ class distribution
     class_counts  = train_ds.get_class_counts()
@@ -388,7 +395,6 @@ def run_finetune():
     best_acc    = 0.0
     no_improve  = 0
 
-    # Resume từ Drive nếu có, không thì load VGGFace pretrained
     load_path = CONFIG['ckpt_path'] if os.path.exists(CONFIG['ckpt_path']) \
                 else CONFIG['pretrained_path']
 
@@ -397,7 +403,6 @@ def run_finetune():
         ckpt     = torch.load(load_path, map_location='cpu')
         sd       = ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt))
         model_sd = model.state_dict()
-        # Chỉ load các layer shape khớp (an toàn khi load pretrained 2622-class)
         sd = {k: v for k, v in sd.items()
               if k in model_sd and v.shape == model_sd[k].shape}
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -424,7 +429,6 @@ def run_finetune():
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     scaler    = GradScaler()
 
-    # Resume optimizer state nếu có
     if os.path.exists(CONFIG['ckpt_path']):
         ckpt = torch.load(CONFIG['ckpt_path'], map_location='cpu')
         if 'optimizer_state_dict' in ckpt:
@@ -462,7 +466,7 @@ def run_finetune():
             tr_correct += (out.argmax(1) == labels).sum().item()
             tr_total   += len(labels)
 
-        # ── Validate — no AMP needed, torch.no_grad() đã đủ ───────────────
+        # ── Validate — no AMP needed ───────────────────────────────────────
         model.eval()
         val_correct = val_total = 0
         with torch.no_grad():
@@ -500,7 +504,7 @@ def run_finetune():
 
         if time.time() - global_start > CONFIG['time_limit_sec']:
             elapsed = (time.time() - global_start) / 3600
-            print(f"\n⏳ {elapsed:.1f}h elapsed — stopping to save outputs")
+            print(f"\n⏳ {elapsed:.1f}h elapsed — stopping")
             break
 
     print(f"\n✅ Training done | Best ValAcc = {best_acc:.4f}")
@@ -512,11 +516,9 @@ def run_finetune():
 # ==========================================
 def extract_features_with_bbox(model, split):
     """
-    Group face crops theo ảnh gốc, extract fc7 4096-dim + load bbox thật.
+    Group face crops theo ảnh gốc, extract fc7 4096-dim + bbox thật.
     Output: feat_dir/<split>/<cls_lower>/<orig_name>.npz
-              features: (N, 4096)
-              boxes:    (N, 4)  [x1, y1, x2, y2]
-    Caller phải đảm bảo model.eval() đã được gọi trước.
+    Caller phải gọi model.eval() trước khi gọi hàm này.
     """
     split_dir = os.path.join(CONFIG['crop_dir'], split)
     if not os.path.exists(split_dir):
@@ -529,6 +531,8 @@ def extract_features_with_bbox(model, split):
     for cls_name in os.listdir(split_dir):
         if LABEL_MAP.get(cls_name.lower()) is None:
             continue
+
+        # Sau khi crop, cấu trúc flat: crop_dir/Train/Positive/*.jpg
         cls_dir = os.path.join(split_dir, cls_name)
 
         img_files = []
@@ -548,7 +552,7 @@ def extract_features_with_bbox(model, split):
             bbox_path = stem + '_bbox.npy'
             if os.path.exists(bbox_path):
                 raw  = np.load(bbox_path)
-                bbox = raw[:4].astype(np.float32)   # [x1,y1,x2,y2]
+                bbox = raw[:4].astype(np.float32)
             else:
                 bbox = np.array([0, 0, 1, 1], dtype=np.float32)
                 dummy_count += 1
@@ -556,7 +560,7 @@ def extract_features_with_bbox(model, split):
             groups[(cls_name, orig_name)].append((img_path, bbox))
 
     if dummy_count > 0:
-        print(f"  ⚠️  {dummy_count} faces không có bbox → dùng dummy [0,0,1,1]")
+        print(f"  ⚠️  {dummy_count} faces không có bbox → dummy [0,0,1,1]")
 
     total_saved = 0
     for (cls_name, orig_name), face_list in tqdm(groups.items(), desc=f"  Extract [{split}]"):
@@ -607,7 +611,7 @@ def run_extract():
     model     = VGG_16(num_classes=3, dropout=0.5).to(CONFIG['device'])
     best_ckpt = torch.load(CONFIG['ckpt_path'], map_location='cpu')
     model.load_state_dict(best_ckpt['state_dict'])
-    model.eval()   # tường minh — extract() không tự gọi eval() nữa
+    model.eval()   # tường minh — extract() không tự gọi eval()
     print(f"  ✅ Loaded checkpoint "
           f"(epoch {best_ckpt['epoch']}, ValAcc={best_ckpt['best_acc']:.4f})")
 
@@ -628,9 +632,9 @@ def run_extract():
         print(f"   boxes:    {s['boxes'].shape}      ← (num_faces, 4)")
         print(f"   boxes[0]: {s['boxes'][0]}")
 
-    # Zip features lên Drive
+    # Zip → Drive
     print("\n📦 Zipping features → Drive...")
-    feat_zip = os.path.join(CONFIG['output_dir'], 'vggface_gaf2_features.zip')
+    feat_zip = os.path.join(CONFIG['output_dir'], 'vggface_gaf3_features.zip')
     with zipfile.ZipFile(feat_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(CONFIG['feat_dir']):
             for f in files:
@@ -646,9 +650,9 @@ def run_extract():
 # ==========================================
 def main():
     print("=" * 70)
-    print("  VGGFace GAF2 v4 — DETECT → FINETUNE → EXTRACT")
+    print("  VGGFace GAF3 v4 — DETECT → FINETUNE → EXTRACT")
     print(f"  Device     : {CONFIG['device']}")
-    print(f"  Batch size : {CONFIG['batch_size']}  (A100 optimized)")
+    print(f"  Batch size : {CONFIG['batch_size']}")
     print(f"  LR         : {CONFIG['lr']}")
     print(f"  LABEL_MAP  : {LABEL_MAP}")
     print("=" * 70 + "\n")
